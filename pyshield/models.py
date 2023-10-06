@@ -1,8 +1,13 @@
+import sys
 import itertools
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
+from tqdm import tqdm
+from tqdm.contrib.concurrent import process_map
+from p_tqdm import p_map
+from multiprocessing import Pool
 from collections import defaultdict
 
 
@@ -16,32 +21,42 @@ class Shield:
         )
         self.reachability_dict = defaultdict(set)
         self.samples_per_axis = samples_per_axis
+        self.n_partitions = np.prod(self.grid.shape)
 
-    def compute_reachability_function(self):
-        for partition in self.grid.bins():
-            region = self.grid.bins_to_region(partition)
-            sp = self.grid.get_supporting_points(
-                region,
-                per_axis=self.samples_per_axis
-            )
+    def find_reachable(self, partition):
+        region = self.grid.bins_to_region(partition)
+        sp = self.grid.get_supporting_points(
+            region,
+            per_axis=self.samples_per_axis
+        )
 
-            for s in sp:
-                # mark unsafe partitions while we are at it
-                if not self.env.is_safe(s):
-                    self.safe_actions[partition] = False
+        out = defaultdict(set)
+        safe = True
+        for s in sp:
+            # mark unsafe partitions while we are at it
+            if not self.env.is_safe(s):
+                safe = False
 
-                # map (action, state) to set of reacable partitions
-                for a in self.env.allowed_actions(s):
-                # for a in range(self.env.action_space.n):
-                    ns, _, _ = self.env.step_from(s, a)
-                    npartition = self.grid.s_to_bin(ns)
-                    self.reachability_dict[(a,) + partition].add(npartition)
+            # map (action, state) to set of reachable partitions
+            for a in self.env.allowed_actions(s):
+                ns, _, _ = self.env.step_from(s, a)
+                npartition = self.grid.s_to_bin(ns)
+                out[a].add(npartition)
 
-    def make_shield(self, max_steps=1000, verbosity=0):
+        return (partition, out, safe)
+
+    def compute_reachability_function(self, chunksize):
+        res = Pool().map(self.find_reachable, list(self.grid.bins()))
+        for partition, reachable, safe in res:
+            self.reachability_dict[partition] = reachable
+            if not safe:
+                self.safe_actions[partition] = False
+
+    def make_shield(self, max_steps=1000, chunksize=1, verbosity=0):
         if verbosity > 0:
             print('computing reachability function...')
 
-        self.compute_reachability_function()
+        self.compute_reachability_function(chunksize)
 
         # iteratively synthesize shield until fixed point (or max iterations)
         print('synthesizing shield...')
@@ -78,7 +93,7 @@ class Shield:
         return updates
 
     def reachable(self, bin_id, a):
-        return self.reachability_dict[(a,) + bin_id]
+        return self.reachability_dict[bin_id][a]
 
     def draw(self, cmap, axis_labels=('x','y'),
              actions=None, out_fp='./shield.png', show=False, lw=0):
@@ -158,14 +173,9 @@ class Grid:
     def s_to_bin(self, s):
         s = np.array(s, dtype=self.dtype)
 
-        # try:
-        #     assert self.obs_space.contains(s)
-        # except AssertionError:
-        #     s = np.vstack((s, self.obs_space.low + 1e-6)).T.max(axis=1)
-        #     s = np.vstack((s, self.obs_space.high - 1e-6)).T.min(axis=1)
-
         res = np.array((s - self.obs_space.low) // self.g, dtype=np.int16)
         res = np.vstack((res, self.n_bins-1)).T.min(axis=1)
+        res[res < 0] = 0
 
         return tuple(res)
 
