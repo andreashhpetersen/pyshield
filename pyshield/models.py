@@ -1,12 +1,12 @@
+import os
 import sys
+import resource
 import itertools
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
 from tqdm import tqdm
-from tqdm.contrib.concurrent import process_map
-from p_tqdm import p_map
 from multiprocessing import Pool
 from collections import defaultdict
 
@@ -24,7 +24,7 @@ class Shield:
         self.n_partitions = np.prod(self.grid.shape)
 
     def find_reachable(self, partition):
-        region = self.grid.bins_to_region(partition)
+        region = self.grid.ridx_to_region(partition)
         sp = self.grid.get_supporting_points(
             region,
             per_axis=self.samples_per_axis
@@ -40,23 +40,38 @@ class Shield:
             # map (action, state) to set of reachable partitions
             for a in self.env.allowed_actions(s):
                 ns, _, _ = self.env.step_from(s, a)
-                npartition = self.grid.s_to_bin(ns)
+                npartition = self.grid.s_to_ridx(ns)
                 out[a].add(npartition)
 
         return (partition, out, safe)
 
-    def compute_reachability_function(self, chunksize):
-        res = Pool().map(self.find_reachable, list(self.grid.bins()))
-        for partition, reachable, safe in res:
+    def compute_reachability_function_single(self):
+        data = map(self.find_reachable, self.grid.regions())
+        for partition, reachable, safe in tqdm(data, total=self.n_partitions):
             self.reachability_dict[partition] = reachable
             if not safe:
                 self.safe_actions[partition] = False
 
-    def make_shield(self, max_steps=1000, chunksize=1, verbosity=0):
+    def compute_reachability_function_multi(self):
+        with Pool() as p:
+            res = p.map(self.find_reachable, self.grid.regions())
+            for partition, reachable, safe in res:
+                self.reachability_dict[partition] = reachable
+                if not safe:
+                    self.safe_actions[partition] = False
+
+    def make_shield(self, max_steps=1000, multi=True, verbosity=0):
         if verbosity > 0:
             print('computing reachability function...')
 
-        self.compute_reachability_function(chunksize)
+        try:
+            if multi:
+                self.compute_reachability_function_multi()
+            else:
+                self.compute_reachability_function_single()
+        except KeyboardInterrupt:
+            print('KeyboardInterrupt, exit quietly')
+            return
 
         # iteratively synthesize shield until fixed point (or max iterations)
         print('synthesizing shield...')
@@ -76,7 +91,7 @@ class Shield:
     def _synthesize(self):
         # keep track of how many updates we make (to check for fixed point)
         updates = 0
-        for partition in self.grid.bins():
+        for partition in self.grid.regions():
 
             # get safe actions at this partition
             safe_actions = np.argwhere(self.safe_actions[partition]).T[0]
@@ -102,9 +117,9 @@ class Shield:
         labels = []
         # cmap = { '()': 'r', '(hit)': 'g', '(nohit)': 'y', '(nohit, hit)': 'w' }
 
-        for bin_ids in self.grid.bins():
-            region = self.grid.bins_to_region(bin_ids)
-            safe_actions = np.argwhere(self.safe_actions[bin_ids]).T[0]
+        for ridx in self.grid.regions():
+            region = self.grid.ridx_to_region(ridx)
+            safe_actions = np.argwhere(self.safe_actions[ridx]).T[0]
             safe_actions = [actions[a] for a in safe_actions]
 
             label = '({})'.format(', '.join(safe_actions))
@@ -160,7 +175,7 @@ class Grid:
         assert len(self.obs_space.shape) == 1
 
         self.n_features = self.obs_space.shape[0]
-        self.n_bins = np.array(
+        self._shape = np.array(
             (self.obs_space.high - self.obs_space.low) // self.g,
             dtype=np.int16
         )
@@ -168,41 +183,30 @@ class Grid:
 
     @property
     def shape(self):
-        return tuple(self.n_bins)
+        return tuple(self._shape)
 
-    def s_to_bin(self, s):
+    def s_to_ridx(self, s):
         s = np.array(s, dtype=self.dtype)
 
         res = np.array((s - self.obs_space.low) // self.g, dtype=np.int16)
-        res = np.vstack((res, self.n_bins-1)).T.min(axis=1)
+        res = np.vstack((res, self._shape-1)).T.min(axis=1)
         res[res < 0] = 0
 
         return tuple(res)
 
-    def bins_to_region(self, bins):
-        if not isinstance(bins, np.ndarray):
-            bins = np.array(bins, dtype=np.int16)
+    def ridx_to_region(self, ridx):
+        if not isinstance(ridx, np.ndarray):
+            ridx = np.array(ridx, dtype=np.int16)
 
-        low = (bins * self.g) + self.obs_space.low
+        low = (ridx * self.g) + self.obs_space.low
         high = low + self.g
         return np.vstack((low, high), dtype=self.dtype).T
-
-    def sample_from_bins(self, bins, n=1):
-        region = self.bins_to_region(bins)
-        return self.sample_from_region(region, n=n)
-
-    def sample_from_region(self, region, n=1):
-        return np.random.uniform(
-            region[:,0],
-            region[:,1],
-            size=(n, self.n_features)
-        )
 
     def get_supporting_points(self, region, per_axis=2, eps=1e-6):
         coordinates = np.linspace(region[:,0], region[:,1] - eps, num=per_axis)
         return np.array(list(itertools.product(*coordinates.T)))
 
-    def bins(self):
-        steps = [np.arange(n_bins) for n_bins in self.n_bins]
-        for bin_ids in itertools.product(*steps):
-            yield bin_ids
+    def regions(self, idx=True):
+        steps = [np.arange(n) for n in self.shape]
+        for ridx in itertools.product(*steps):
+            yield ridx if idx else self.ridx_to_region(ridx)
