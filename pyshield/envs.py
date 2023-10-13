@@ -5,7 +5,6 @@ import gymnasium as gym
 from gymnasium import logger, spaces
 from gymnasium.envs.classic_control import utils
 
-
 # gravity
 G = -9.81
 
@@ -642,3 +641,302 @@ class CruiseControlEnv(gym.Env):
             return self.v_front_max
 
         pass
+
+
+class DCDCBoostConverterEnv(gym.Env):
+    metadata = { 'render_mode': [] }
+
+    # hybrid states
+    D1U1 = 0
+    D1U0 = 1
+    D0U0 = 2
+    PU0D0 = 3
+    PD1U1 = 4
+    PD1U0 = 5
+
+    def __init__(
+        self, render_mode=None,
+        obs_low=[0, 14.4, 30.], obs_high=[4.1, 15.6, 200.], unlucky=False
+    ):
+        self.observation_space = gym.spaces.Box(
+            low=np.array(obs_low, dtype=np.float32),
+            high=np.array(obs_high, dtype=np.float32)
+        )
+        self.action_space = gym.spaces.Discrete(2)
+
+        # state variables
+        self.x1 = 0.
+        self.x2 = 0.
+        self.R = 73.
+
+        # hybrid state
+        self.hybrid_state = self.PU0D0
+
+        # target values
+        self.x1_ref = 0.35
+        self.x2_ref = 15.
+
+        # minimize this (distance from x1,x2 to target values)
+        self.dist = 0
+
+        # safety constraints
+        self.x1_min = 0
+        self.x1_max = 4
+        self.x2_min = 14.5
+        self.x2_max = 15.5
+
+        # constants
+        self.L = 450e-6             # Inductors inductance
+        self.RL = 0.3               # Inductors resistance
+        self.Co = 220e-6            # Capacitators capacitance
+        self.vs = 10.0              # Input voltage
+        self.scale = 1.0 / 0.00005  # time scale
+
+        self.R_fluct= 30.  # Output consumption
+        self.R_min = 30.
+        self.R_max = 200.
+
+        # euler method step size
+        self.h = 0.1
+
+    def is_safe(self, state):
+        x1, x2, _ = state
+        return self.x1_min <= x1 <= self.x1_max and \
+            self.x2_min <= x2 <= self.x2_max
+
+    def is_terminal(self, state):
+        return False if self.is_safe(state) else True
+
+    def allowed_actions(self, state):
+        return [0,1] if self.is_safe(state) else []
+
+    def reset(self):
+        self.dist = 0.
+        self.x1 = 0.
+        self.x2 = 0.
+        self.R = 73.  # Output consumption
+        self.hybrid_state = self.PU0D0
+
+        return self._get_obs(), self._get_info()
+
+    def step(self, action):
+        nstate = self._step(self._get_obs(), action)
+        reward = self.reward(nstate)
+        terminated = self.is_terminal(nstate)
+
+        x1, x2, R = nstate
+        self.x1 = x1
+        self.x2 = x2
+        self.R = R
+        self.dist += self.get_dist(nstate)
+
+        return nstate, reward, terminated, False, self._get_info()
+
+    def step_from(self, state, action):
+        nstate = self._step(state, action)
+        return nstate, self.reward(nstate), self.is_terminal(nstate)
+
+    def _step(self, state, action):
+        x1, x2, R = state
+
+        R_update = self._get_random_R()
+        while R + R_update <= self.R_min or R + R_update >= self.R_max:
+            R_update = self._get_random_R()
+        R += R_update
+
+        L, RL, Co, vs, s = self._get_constants()
+
+        for _ in range(int(1 / self.h)):
+            # on
+            if action == 1:
+                self.hybrid_state = self.PD1U1
+                x1 += self.h * (-RL * x1 / L + vs / L) / s
+                x2 += self.h * (-x2 / Co * R) / s
+
+            # off
+            elif action == 0 and x1 > 0:
+                self.hybrid_state = self.PD1U0
+                x1 += self.h * (-RL * x1 / L + -x2 / L + vs / L) / s
+                x2 += self.h * (x1 / Co + -x2 / Co * R) / s
+
+            # off but x1 is negative
+            elif action == 0 and x1 <= 0:
+                self.hybrid_state = self.PU0D0
+                x1 += 0
+                x2 += self.h * (-x2 / Co * R) / s
+
+        return (x1, x2, R)
+
+    def get_dist(self, state):
+        x1, x2, R = state
+        r1 = abs(x1 - self.x1_ref)
+        r2 = (x2 - self.x2_ref)**2
+        return r2 + r1 / 3.0
+
+    def reward(self, state):
+        return -self.get_dist(state)
+
+    def _get_obs(self):
+        return [self.x1, self.x2, self.R]
+
+    def _get_info(self):
+        return { 'hybrid_state': self.hybrid_state }
+
+    def _get_random_R(self):
+        return np.random.randint(-self.R_fluct, self.R_fluct + 1)
+
+    def _get_constants(self):
+        return self.L, self.RL, self.Co, self.vs, self.scale
+
+
+class OilPumpEnv(gym.Env):
+    metadata = { 'render_modes': [] }
+
+    OFF = 0
+    ON = 1
+
+    def __init__(
+        self, render_mode=None,
+        obs_low=[0, 4.9, 0, 0], obs_high=[20, 25.1, 1, 2], unlucky=False
+    ):
+
+        self.observation_space = gym.spaces.Box(
+            low=np.array(obs_low, dtype=np.float32),
+            high=np.array(obs_high, dtype=np.float32)
+        )
+        self.action_space = gym.spaces.Discrete(2)
+        self.unlucky = unlucky
+
+        # mechanics
+        self.v_min = 4.9
+        self.v_max = 25.1
+        self.period = 20
+        self.time_step = 0.2
+        self.inflow = 0.2
+        self.fluctuation = 0.1
+        self.imprecision = 0.06
+        self.latency = 2
+
+        # track the time that has elapsed and total accumulated oil volume
+        self.elapsed = 0.
+        self.accumulated_v = 0.
+
+        # state is tuple (t, v, p, l) where
+            # t is  the time in the consumption cycle
+            # v is the volume of oil in the tank
+            # p is the pump status ('on' or 'off')
+            # l is th latency timer controlling how often the pump can switch
+            # state
+
+        self.reset()
+
+    def reset(self):
+        self.t = 0.
+        self.v = 10.
+        self.p = 0.
+        self.l = 0.
+
+        self.elapsed = 0.
+        self.accumulated_v = 0.
+
+        return self._get_obs(), self._get_info()
+
+    def is_safe(self, state):
+        _, v, _, _ = state
+        return self.v_min <= v <= self.v_max
+
+    def allowed_actions(self, state):
+        return [0, 1] if self.is_safe(state) else []
+
+    def reward(self, state):
+        elapsed = self.elapsed if self.elapsed > 0 else self.time_step
+        return (self.time_step / elapsed) * self.accumulated_v
+
+    def step(self, action):
+        nstate = self._step(self._get_obs(), action)
+
+        t, v, p, l = nstate
+        self.t = t
+        self.v = v
+        self.p = p
+        self.l = l
+
+        self.accumulated_v += v
+        self.elapsed += self.time_step
+
+        reward = self.reward(nstate)
+        terminated = not self.is_safe(nstate)
+
+        return nstate, reward, terminated, False, self._get_obs()
+
+    def step_from(self, state, action):
+        nstate = self._step(state, action)
+        return nstate, self.reward(nstate), not self.is_safe(nstate)
+
+    def _step(self, state, action):
+        t, v, p, l = state
+        p = round(p)
+
+        if action != p and l <= 0.0:
+            p = action
+            l = self.latency
+
+        td = t
+        fluctuation_updated = False
+        fluctuation = self._get_random()
+        while td < t + self.time_step:
+
+            # update fluctuation if we are over halway there
+            if td >= t + self.time_step / 2:
+                if not fluctuation_updated:
+                    fluctuation = self._get_random()
+                    fluctuation_updated = True
+
+            time_step = min(
+                t + self.time_step - td,
+                self.next_rate_change(td) - td
+            )
+            consumption = self.consumption_rate(td)
+            if consumption > 0:
+                consumption += fluctuation
+
+            v = v - consumption * time_step
+            td += time_step
+
+        td = td % 20
+        l -= self.time_step
+        if p == self.ON:
+            v += self.inflow * self.time_step
+
+        return td, v, p, l
+
+    def next_rate_change(self, t):
+        return t - (t % 2) + 2
+
+    def consumption_rate(self, t):
+        if t < 2:
+            return 0
+        if t < 4:
+            return 1.2
+        if t < 8:
+            return 0
+        if t < 10:
+            return 2.5
+        if t < 12:
+            return 2.5
+        if t < 14:
+            return 0
+        if t < 16:
+            return 1.7
+        if t < 18:
+            return 0.5
+        return 0
+
+    def _get_random(self):
+        return np.random.random() * (self.fluctuation * 2) - self.fluctuation
+
+    def _get_obs(self):
+        return np.array([self.t, self.v, self.p, self.l], dtype=np.float32)
+
+    def _get_info(self):
+        return {}
