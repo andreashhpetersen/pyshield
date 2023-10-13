@@ -1,0 +1,5 @@
+gymnasium==0.27.0
+gymnasium-notices==0.0.1
+matplotlib==3.5.1
+matplotlib-inline==0.1.6
+numpy==1.21.5
